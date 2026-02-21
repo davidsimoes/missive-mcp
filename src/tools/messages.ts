@@ -106,7 +106,7 @@ Use strip_html=true (default) to convert HTML to plain text.`,
         `/messages/${message_id}`
       );
 
-      const message = data.messages?.[0];
+      const message = Array.isArray(data.messages) ? data.messages[0] : data.messages;
       if (!message) {
         return {
           content: [

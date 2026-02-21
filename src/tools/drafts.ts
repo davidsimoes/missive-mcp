@@ -248,7 +248,7 @@ Only the body content is required. The draft can be reviewed in Missive or sent 
       const original = await client.get<MessageResponse>(
         `/messages/${params.message_id}`
       );
-      const msg = original.messages?.[0];
+      const msg = Array.isArray(original.messages) ? original.messages[0] : original.messages;
       if (!msg) {
         return {
           content: [
@@ -280,7 +280,7 @@ Only the body content is required. The draft can be reviewed in Missive or sent 
           cc_fields: cc_fields.length > 0 ? cc_fields : undefined,
           subject,
           body: params.body,
-          conversation: msg.conversation,
+          conversation: typeof msg.conversation === 'string' ? msg.conversation : msg.conversation?.id,
           from_field: params.from_field,
           attachments: params.attachments,
           send: false,
