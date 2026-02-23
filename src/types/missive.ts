@@ -188,7 +188,8 @@ export interface PostsResponse {
 }
 
 export interface PostResponse {
-  posts: Post[];
+  // Missive API returns posts as a single object, not an array
+  posts: Post | Post[];
 }
 
 // Comment

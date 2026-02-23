@@ -132,11 +132,11 @@ export function registerDraftTools(server: McpServer, getClient: ClientResolver)
     'create_draft',
     {
       title: 'Create Draft',
-      description: `Creates a draft message that is NOT sent. Use this when the user wants to compose a message and review it before sending.
+      description: `Creates a draft message. Can optionally schedule it for later sending.
 
-The draft will be saved and can be viewed in Missive or sent later using send_message.
+For replies, provide the conversation ID and the from/to addresses. For new messages, omit the conversation ID.
 
-For replies, provide the conversation ID and the from/to addresses. For new messages, omit the conversation ID and use any from/to addresses specified by the user.`,
+To schedule a send: provide send_at with an ISO 8601 timestamp (e.g. "2026-02-23T06:00:00Z"). The message will be sent automatically at that time. Without send_at, the draft is saved for manual review/send.`,
       inputSchema: {
         // Recipients
         to_fields: z
@@ -163,6 +163,11 @@ For replies, provide the conversation ID and the from/to addresses. For new mess
         from_field: EmailFieldSchema.optional().describe(
           'Sender address (uses default if omitted)'
         ),
+        // Scheduling
+        send_at: z
+          .string()
+          .optional()
+          .describe('ISO 8601 timestamp to schedule send (e.g. "2026-02-23T06:00:00Z"). Omit for unsent draft.'),
         // Attachments
         attachments: z
           .array(AttachmentSchema)
@@ -172,19 +177,29 @@ For replies, provide the conversation ID and the from/to addresses. For new mess
       },
     },
     async (params, extra) => {
+      const draftPayload: Record<string, unknown> = {
+        to_fields: params.to_fields,
+        cc_fields: params.cc_fields,
+        bcc_fields: params.bcc_fields,
+        subject: params.subject,
+        body: params.body,
+        conversation: params.conversation,
+        from_field: params.from_field,
+        attachments: params.attachments,
+      };
+
+      if (params.send_at) {
+        // Missive API expects Unix timestamp (integer seconds), not ISO string
+        draftPayload.send_at = Math.floor(new Date(params.send_at).getTime() / 1000);
+      } else {
+        draftPayload.send = false;
+      }
+
       const data = await getClient(extra).post<DraftResponse>('/drafts', {
-        drafts: {
-          to_fields: params.to_fields,
-          cc_fields: params.cc_fields,
-          bcc_fields: params.bcc_fields,
-          subject: params.subject,
-          body: params.body,
-          conversation: params.conversation,
-          from_field: params.from_field,
-          attachments: params.attachments,
-          send: false,
-        },
+        drafts: draftPayload,
       });
+
+      const isScheduled = !!params.send_at;
 
       return {
         content: [
@@ -193,7 +208,11 @@ For replies, provide the conversation ID and the from/to addresses. For new mess
             text: JSON.stringify(
               {
                 draft: data.drafts[0],
-                message: 'Draft created successfully. Use send_message to send it.',
+                scheduled: isScheduled,
+                send_at: params.send_at || null,
+                message: isScheduled
+                  ? `Email scheduled for ${params.send_at}.`
+                  : 'Draft created successfully. Use send_message to send it.',
               },
               null,
               2
@@ -280,7 +299,7 @@ Only the body content is required. The draft can be reviewed in Missive or sent 
           cc_fields: cc_fields.length > 0 ? cc_fields : undefined,
           subject,
           body: params.body,
-          conversation: typeof msg.conversation === 'string' ? msg.conversation : msg.conversation?.id,
+          conversation: msg.conversation,
           from_field: params.from_field,
           attachments: params.attachments,
           send: false,

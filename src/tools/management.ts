@@ -10,20 +10,29 @@ import type { PostResponse } from '../types/missive.js';
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export function registerManagementTools(server: McpServer, getClient: ClientResolver): void {
-  // batch_close — close multiple conversations with minimal notification noise
+  // batch_close — close multiple conversations cleanly (close + delete post)
+  //
+  // WHY THE DELETE STEP:
+  // Missive API has NO way to close a conversation without creating a post.
+  // The post stays UNREAD even when an Org Rule marks messages as read on close.
+  // This defeats the purpose — closing should = marking as read.
+  //
+  // SOLUTION (tested Feb 2026):
+  // 1. Create post with close=true → conversation closes, post is created
+  // 2. Immediately delete the post → close persists, unread indicator disappears
+  //
+  // DO NOT remove the delete step. Without it, every close floods the inbox
+  // with unread posts. This was tested extensively and caused real damage.
   server.registerTool(
     'batch_close',
     {
       title: 'Batch Close Conversations',
-      description: `Closes multiple conversations sequentially with minimal notification noise.
+      description: `Closes multiple conversations cleanly — no unread indicators left behind.
 
-Uses zero-width space text and empty notifications to minimize Missive sidebar clutter.
-Adds a 500ms delay between closes to spread out any notifications.
+For each conversation: creates a post to trigger the close, then immediately deletes the post
+so it doesn't leave an unread item in the inbox.
 
-Returns a summary of successes and failures.
-
-IMPORTANT: Missive API has no way to close silently — each close creates a post.
-Use this instead of calling create_post in parallel to reduce notification spam.`,
+Returns a summary of successes and failures.`,
       inputSchema: {
         organization: z
           .string()
@@ -38,11 +47,12 @@ Use this instead of calling create_post in parallel to reduce notification spam.
     },
     async (params, extra) => {
       const client = getClient(extra);
-      const results: { id: string; ok: boolean; error?: string }[] = [];
+      const results: { id: string; ok: boolean; postDeleted: boolean; error?: string }[] = [];
 
       for (const id of params.conversation_ids) {
         try {
-          await client.post<PostResponse>('/posts', {
+          // Step 1: Close the conversation (creates a post)
+          const data = await client.post<PostResponse>('/posts', {
             posts: {
               conversation: id,
               organization: params.organization,
@@ -51,13 +61,28 @@ Use this instead of calling create_post in parallel to reduce notification spam.
               notification: { title: '', body: '' },
             },
           });
-          results.push({ id, ok: true });
+
+          // Step 2: Delete the post so it doesn't stay as unread
+          // Note: Missive API returns posts as object {id, ...}, NOT array [{id, ...}]
+          let postDeleted = false;
+          const posts = data.posts as unknown;
+          const postId = Array.isArray(posts) ? posts[0]?.id : (posts as Record<string, unknown>)?.id;
+          if (postId) {
+            try {
+              await client.delete(`/posts/${postId}`);
+              postDeleted = true;
+            } catch {
+              // Post deletion failed — close still worked, but unread indicator may remain
+            }
+          }
+
+          results.push({ id, ok: true, postDeleted });
         } catch (err: unknown) {
           const message = err instanceof Error ? err.message : String(err);
-          results.push({ id, ok: false, error: message });
+          results.push({ id, ok: false, postDeleted: false, error: message });
         }
 
-        // Small delay between closes to spread out notifications
+        // Small delay between closes
         if (params.conversation_ids.indexOf(id) < params.conversation_ids.length - 1) {
           await sleep(500);
         }
@@ -65,6 +90,7 @@ Use this instead of calling create_post in parallel to reduce notification spam.
 
       const succeeded = results.filter((r) => r.ok).length;
       const failed = results.filter((r) => !r.ok).length;
+      const postsDeleted = results.filter((r) => r.postDeleted).length;
 
       return {
         content: [
@@ -73,12 +99,14 @@ Use this instead of calling create_post in parallel to reduce notification spam.
             text: JSON.stringify(
               {
                 closed: succeeded,
+                posts_cleaned: postsDeleted,
                 failed,
                 total: params.conversation_ids.length,
                 failures: results.filter((r) => !r.ok),
+                unclean: results.filter((r) => r.ok && !r.postDeleted).map((r) => r.id),
                 message:
                   failed === 0
-                    ? `Successfully closed ${succeeded} conversation(s).`
+                    ? `Closed ${succeeded} conversation(s), cleaned ${postsDeleted} post(s).`
                     : `Closed ${succeeded}, failed ${failed} of ${params.conversation_ids.length}.`,
               },
               null,
@@ -216,6 +244,39 @@ Use list_organizations to get org ID, list_users for user IDs, list_shared_label
                 post: data.posts[0],
                 actions_performed: actions.length > 0 ? actions : ['created post'],
                 message: 'Post created successfully.',
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+  );
+
+  // delete_post
+  server.registerTool(
+    'delete_post',
+    {
+      title: 'Delete Post',
+      description:
+        'Deletes a post by ID. Used to clean up posts after state changes (e.g., close) to avoid leaving unread items.',
+      inputSchema: {
+        post_id: z.string().uuid().describe('The post ID to delete'),
+      },
+    },
+    async ({ post_id }, extra) => {
+      await getClient(extra).delete(`/posts/${post_id}`);
+
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify(
+              {
+                deleted: true,
+                post_id,
+                message: 'Post deleted successfully.',
               },
               null,
               2
