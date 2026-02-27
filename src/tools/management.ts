@@ -1,13 +1,58 @@
 /**
- * Conversation management tools: create posts, close, label, assign
+ * Conversation management tools: create posts, close, label, assign, mark as read
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import * as z from 'zod';
 import type { ClientResolver } from '../types/tools.js';
-import type { PostResponse } from '../types/missive.js';
+import type { PostResponse, SharedLabelsResponse } from '../types/missive.js';
+import type { MissiveClient } from '../client.js';
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** The label name used to trigger the mark-as-read org rule */
+const MARK_READ_LABEL = '_api-read';
+
+/**
+ * Extract post ID from the Missive API response.
+ * API returns posts as object {id, ...} NOT array [{id, ...}] — handle both.
+ */
+function extractPostId(data: PostResponse): string | undefined {
+  const posts = data.posts as unknown;
+  return Array.isArray(posts)
+    ? posts[0]?.id
+    : (posts as Record<string, unknown>)?.id as string | undefined;
+}
+
+/**
+ * Create a post and immediately delete it (silent state change).
+ * Used by batch_close and mark_as_read to change state without leaving unread posts.
+ */
+async function silentPost(
+  client: MissiveClient,
+  postBody: Record<string, unknown>,
+): Promise<{ ok: boolean; postDeleted: boolean }> {
+  const data = await client.post<PostResponse>('/posts', {
+    posts: {
+      text: '\u200B',
+      notification: { title: '', body: '' },
+      ...postBody,
+    },
+  });
+
+  let postDeleted = false;
+  const postId = extractPostId(data);
+  if (postId) {
+    try {
+      await client.delete(`/posts/${postId}`);
+      postDeleted = true;
+    } catch {
+      // Post deletion failed — state change still applied
+    }
+  }
+
+  return { ok: true, postDeleted };
+}
 
 export function registerManagementTools(server: McpServer, getClient: ClientResolver): void {
   // batch_close — close multiple conversations cleanly (close + delete post)
@@ -51,32 +96,12 @@ Returns a summary of successes and failures.`,
 
       for (const id of params.conversation_ids) {
         try {
-          // Step 1: Close the conversation (creates a post)
-          const data = await client.post<PostResponse>('/posts', {
-            posts: {
-              conversation: id,
-              organization: params.organization,
-              close: true,
-              text: '\u200B',
-              notification: { title: '', body: '' },
-            },
+          const result = await silentPost(client, {
+            conversation: id,
+            organization: params.organization,
+            close: true,
           });
-
-          // Step 2: Delete the post so it doesn't stay as unread
-          // Note: Missive API returns posts as object {id, ...}, NOT array [{id, ...}]
-          let postDeleted = false;
-          const posts = data.posts as unknown;
-          const postId = Array.isArray(posts) ? posts[0]?.id : (posts as Record<string, unknown>)?.id;
-          if (postId) {
-            try {
-              await client.delete(`/posts/${postId}`);
-              postDeleted = true;
-            } catch {
-              // Post deletion failed — close still worked, but unread indicator may remain
-            }
-          }
-
-          results.push({ id, ok: true, postDeleted });
+          results.push({ id, ...result });
         } catch (err: unknown) {
           const message = err instanceof Error ? err.message : String(err);
           results.push({ id, ok: false, postDeleted: false, error: message });
@@ -241,7 +266,7 @@ Use list_organizations to get org ID, list_users for user IDs, list_shared_label
             type: 'text' as const,
             text: JSON.stringify(
               {
-                post: data.posts[0],
+                post: Array.isArray(data.posts) ? data.posts[0] : data.posts,
                 actions_performed: actions.length > 0 ? actions : ['created post'],
                 message: 'Post created successfully.',
               },
@@ -277,6 +302,144 @@ Use list_organizations to get org ID, list_users for user IDs, list_shared_label
                 deleted: true,
                 post_id,
                 message: 'Post deleted successfully.',
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+  );
+
+  // mark_as_read — mark conversations as read without closing them
+  //
+  // HOW IT WORKS:
+  // Missive API has NO mark-as-read endpoint. The only way to change read state
+  // is through an Org Rule that fires on a label change.
+  //
+  // SETUP REQUIRED (one-time, in Missive Settings):
+  // 1. Create shared label: "_api-read"
+  // 2. Create org rule: Type=User action, Condition=Added label "_api-read",
+  //    Action=Mark messages as read
+  //
+  // FLOW:
+  // 1. Add "_api-read" label → org rule fires → marks as read
+  // 2. Delete the label-add post (cleanup)
+  // 3. Remove "_api-read" label (reset for next use)
+  // 4. Delete the label-remove post (cleanup)
+  //
+  // Net result: conversation is marked as read, no visible trace left.
+  server.registerTool(
+    'mark_as_read',
+    {
+      title: 'Mark Conversations as Read',
+      description: `Marks conversations as read without closing them.
+
+Uses a label-trigger mechanism: adds a special label that fires an org rule to mark messages as read,
+then removes the label and cleans up all posts.
+
+Requires one-time setup in Missive Settings:
+1. Shared label named "${MARK_READ_LABEL}"
+2. Org rule: when "${MARK_READ_LABEL}" label is added → mark messages as read
+
+Returns a summary of successes and failures.`,
+      inputSchema: {
+        organization: z
+          .string()
+          .uuid()
+          .describe('Organization ID'),
+        conversation_ids: z
+          .array(z.string().uuid())
+          .min(1)
+          .max(50)
+          .describe('Conversation IDs to mark as read (max 50)'),
+      },
+    },
+    async (params, extra) => {
+      const client = getClient(extra);
+
+      // Step 1: Look up the trigger label by name
+      const labelsData = await client.get<SharedLabelsResponse>(
+        '/shared_labels',
+        { organization: params.organization },
+      );
+      const triggerLabel = labelsData.shared_labels.find(
+        (l) => l.name === MARK_READ_LABEL,
+      );
+
+      if (!triggerLabel) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify(
+                {
+                  error: `Label '${MARK_READ_LABEL}' not found. Create it in Missive Settings → Labels.`,
+                  setup_required: true,
+                  setup_steps: [
+                    `1. Create shared label: "${MARK_READ_LABEL}"`,
+                    '2. Create org rule: Type=User action, Condition=Added label "_api-read", Action=Mark messages as read',
+                  ],
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      const results: { id: string; ok: boolean; error?: string }[] = [];
+
+      for (const id of params.conversation_ids) {
+        try {
+          // Step 2: Add the trigger label (fires the org rule)
+          await silentPost(client, {
+            conversation: id,
+            organization: params.organization,
+            add_shared_labels: [triggerLabel.id],
+          });
+
+          // Brief pause to let the rule process
+          await sleep(300);
+
+          // Step 3: Remove the trigger label (reset for next use)
+          await silentPost(client, {
+            conversation: id,
+            organization: params.organization,
+            remove_shared_labels: [triggerLabel.id],
+          });
+
+          results.push({ id, ok: true });
+        } catch (err: unknown) {
+          const message = err instanceof Error ? err.message : String(err);
+          results.push({ id, ok: false, error: message });
+        }
+
+        // Small delay between conversations
+        if (params.conversation_ids.indexOf(id) < params.conversation_ids.length - 1) {
+          await sleep(500);
+        }
+      }
+
+      const succeeded = results.filter((r) => r.ok).length;
+      const failed = results.filter((r) => !r.ok).length;
+
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify(
+              {
+                marked_read: succeeded,
+                failed,
+                total: params.conversation_ids.length,
+                failures: results.filter((r) => !r.ok),
+                message:
+                  failed === 0
+                    ? `Marked ${succeeded} conversation(s) as read.`
+                    : `Marked ${succeeded}, failed ${failed} of ${params.conversation_ids.length}.`,
               },
               null,
               2
