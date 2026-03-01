@@ -205,6 +205,10 @@ Use list_organizations to get org ID, list_users for user IDs, list_shared_label
           .string()
           .optional()
           .describe('Post body text (visible in conversation)'),
+        markdown: z
+          .string()
+          .optional()
+          .describe('Post body as markdown (alternative to text, supports richer formatting)'),
         notification: z
           .object({
             title: z.string().describe('Notification title'),
@@ -212,6 +216,10 @@ Use list_organizations to get org ID, list_users for user IDs, list_shared_label
           })
           .optional()
           .describe('Optional notification to display'),
+        mention_ids: z
+          .array(z.string().uuid())
+          .optional()
+          .describe('User IDs to @mention in the post. Mentioned users receive a notification.'),
       },
     },
     async (params, extra) => {
@@ -231,11 +239,19 @@ Use list_organizations to get org ID, list_users for user IDs, list_shared_label
 
       // Content — Missive API requires text/markdown/attachments + notification for every post.
       // Auto-generate minimal content when caller only wants state changes (e.g. silent close).
-      if (params.text) {
+      if (params.markdown) {
+        post.markdown = params.markdown;
+      } else if (params.text) {
         post.text = params.text;
       } else {
         // Minimal text so the API accepts the post
         post.text = '\u200B'; // zero-width space — invisible in Missive UI
+      }
+
+      // mention_ids — Missive API supports mentioning users by ID.
+      // Mentioned users receive a notification even without explicit notification object.
+      if (params.mention_ids?.length) {
+        post.mention_ids = params.mention_ids;
       }
 
       if (params.notification) {
@@ -258,7 +274,8 @@ Use list_organizations to get org ID, list_users for user IDs, list_shared_label
       if (params.add_assignees?.length)
         actions.push(`assigned ${params.add_assignees.length} user(s)`);
       if (params.team) actions.push('moved to team');
-      if (params.text) actions.push('added note');
+      if (params.text || params.markdown) actions.push('added note');
+      if (params.mention_ids?.length) actions.push(`mentioned ${params.mention_ids.length} user(s)`);
 
       return {
         content: [
