@@ -123,7 +123,9 @@ PATs are encrypted at rest with AES-256-GCM. OAuth tokens expire after 1 hour (r
 
 | Tool | Description |
 |------|-------------|
-| `create_post` | Add a post to a conversation; close, label, assign, or move to team |
+| `create_post` | Add a post to a conversation; close, label, assign, mention users, or move to team |
+| `batch_close` | Close multiple conversations cleanly (auto-deletes the state-change post to avoid unread items) |
+| `mark_as_read` | Mark a conversation as read without closing it (requires `_api-read` label + org rule) |
 
 ## Examples
 
@@ -150,6 +152,22 @@ Use list_conversations with domain="example.com"
 2. Use list_organizations to get the org ID
 3. Use create_post with add_assignees=[user_id]
 ```
+
+## Known Missive API Limitations
+
+These are workarounds for gaps in the Missive REST API. We've filed feature requests for proper endpoints.
+
+### No silent close
+The API has no way to close a conversation without creating a visible post. `batch_close` works around this by creating a post with `close: true`, then immediately deleting it. The close persists, the unread post disappears.
+
+### No mark-as-read endpoint
+There's no API endpoint to mark a conversation as read. `mark_as_read` works around this by adding a label (`_api-read`) that triggers an Org Rule configured in Missive to mark conversations as read. The tool then cleans up the label and posts. **Requires a one-time Org Rule setup in Missive.**
+
+### No comment creation
+The API can read comments (`GET /conversations/:id/comments`) but cannot create them. Posts are the only writable content type. This means inline @mentions (which render as highlighted badges in comments) aren't possible via API — `mention_ids` on posts triggers notifications but renders as plain text.
+
+### Undocumented rate limits
+Missive API rate limits aren't published. The server handles 429 responses and enforces conservative client-side limits on send operations.
 
 ## Rate Limits
 
