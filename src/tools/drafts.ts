@@ -7,7 +7,8 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import * as z from 'zod';
 import type { ClientResolver } from '../types/tools.js';
 import { RateLimitError } from '../errors.js';
-import type { DraftsResponse, DraftResponse, MessageResponse } from '../types/missive.js';
+import type { DraftsResponse, DraftResponse, MessageResponse, SharedLabelsResponse } from '../types/missive.js';
+import { silentPost, sleep, MARK_READ_LABEL } from './management.js';
 
 /**
  * Rate limiter for send operations
@@ -371,6 +372,12 @@ For replies, provide the conversation ID. For new messages, omit it.`,
         from_field: EmailFieldSchema.optional().describe(
           'Sender address (uses default if omitted)'
         ),
+        // Organization (for auto mark-as-read after send)
+        organization: z
+          .string()
+          .uuid()
+          .optional()
+          .describe('Organization ID. When provided with conversation, auto-marks the conversation as read after sending.'),
         // Attachments
         attachments: z
           .array(AttachmentSchema)
@@ -406,6 +413,38 @@ For replies, provide the conversation ID. For new messages, omit it.`,
 
       rateLimiter.recordSend();
 
+      // Auto mark-as-read: when replying to an existing conversation,
+      // mark it as read so it doesn't stay unread after sending.
+      let markedRead = false;
+      if (params.conversation && params.organization) {
+        try {
+          const client = getClient(extra);
+          const labelsData = await client.get<SharedLabelsResponse>(
+            '/shared_labels',
+            { organization: params.organization },
+          );
+          const triggerLabel = labelsData.shared_labels.find(
+            (l) => l.name === MARK_READ_LABEL,
+          );
+          if (triggerLabel) {
+            await silentPost(client, {
+              conversation: params.conversation,
+              organization: params.organization,
+              add_shared_labels: [triggerLabel.id],
+            });
+            await sleep(2000);
+            await silentPost(client, {
+              conversation: params.conversation,
+              organization: params.organization,
+              remove_shared_labels: [triggerLabel.id],
+            });
+            markedRead = true;
+          }
+        } catch {
+          // Mark-as-read failed silently — the send itself succeeded
+        }
+      }
+
       return {
         content: [
           {
@@ -413,8 +452,11 @@ For replies, provide the conversation ID. For new messages, omit it.`,
             text: JSON.stringify(
               {
                 sent: true,
+                marked_read: markedRead,
                 draft: data.drafts[0],
-                message: 'Email sent successfully.',
+                message: markedRead
+                  ? 'Email sent and conversation marked as read.'
+                  : 'Email sent successfully.',
               },
               null,
               2

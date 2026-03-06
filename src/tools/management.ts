@@ -8,10 +8,10 @@ import type { ClientResolver } from '../types/tools.js';
 import type { PostResponse, SharedLabelsResponse } from '../types/missive.js';
 import type { MissiveClient } from '../client.js';
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+export const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** The label name used to trigger the mark-as-read org rule */
-const MARK_READ_LABEL = '_api-read';
+export const MARK_READ_LABEL = '_api-read';
 
 /**
  * Extract post ID from the Missive API response.
@@ -28,7 +28,7 @@ function extractPostId(data: PostResponse): string | undefined {
  * Create a post and immediately delete it (silent state change).
  * Used by batch_close and mark_as_read to change state without leaving unread posts.
  */
-async function silentPost(
+export async function silentPost(
   client: MissiveClient,
   postBody: Record<string, unknown>,
 ): Promise<{ ok: boolean; postDeleted: boolean }> {
@@ -418,8 +418,10 @@ Returns a summary of successes and failures.`,
             add_shared_labels: [triggerLabel.id],
           });
 
-          // Brief pause to let the rule process
-          await sleep(300);
+          // Pause to let the Missive org rule fire and process the label change.
+          // 300ms was too short — the rule didn't fire before the label was removed.
+          // 2000ms confirmed working Mar 2026.
+          await sleep(2000);
 
           // Step 3: Remove the trigger label (reset for next use)
           await silentPost(client, {
