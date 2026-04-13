@@ -378,6 +378,16 @@ For replies, provide the conversation ID. For new messages, omit it.`,
           .uuid()
           .optional()
           .describe('Organization ID. When provided with conversation, auto-marks the conversation as read after sending.'),
+        // Team routing
+        team: z
+          .string()
+          .uuid()
+          .optional()
+          .describe('Team ID to route the new conversation to.'),
+        add_to_team_inbox: z
+          .boolean()
+          .optional()
+          .describe('When true, adds the conversation to the team inbox. Requires team to be set.'),
         // Attachments
         attachments: z
           .array(AttachmentSchema)
@@ -407,6 +417,8 @@ For replies, provide the conversation ID. For new messages, omit it.`,
           conversation: params.conversation,
           from_field: params.from_field,
           attachments: params.attachments,
+          team: params.team,
+          add_to_team_inbox: params.add_to_team_inbox,
           send: true,
         },
       });

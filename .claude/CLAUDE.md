@@ -1,3 +1,5 @@
+@.claude/lessons.md
+
 # Project: Missive MCP Server
 
 ## Tech Stack
