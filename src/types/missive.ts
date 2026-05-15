@@ -93,6 +93,7 @@ export interface Attachment {
   filename: string;
   size: number;
   content_type: string;
+  url?: string;
 }
 
 export interface EmailAddress {
