@@ -1,0 +1,145 @@
+#!/bin/bash
+# Git pre-push security scan
+# Scans every object a push would publish (and the added lines of changed files) for sensitive
+# patterns before allowing the push. Needs git >= 2.36 (--diff-merges=remerge); older git refuses.
+# Enable in your local clone with: git config core.hooksPath .githooks
+# Bypass once with: git push --no-verify
+set -euo pipefail
+
+# Optional blocklist file. The default location is the author's personal blocklist;
+# contributors can set GIT_OS_BLOCKLIST=/path/to/their/own to override.
+BLOCKLIST="${GIT_OS_BLOCKLIST:-$HOME/.claude/knowledge/opensource-security-blocklist.md}"
+
+# Always-on regex sweep (no blocklist file required). API key shapes we never want to push.
+API_KEY_REGEX='AIzaSy[A-Za-z0-9_-]{33}|sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{36}|gho_[A-Za-z0-9]{36}|ghs_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,}|xox[bps]-[0-9]+-[0-9]+-[A-Za-z0-9]+|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.|AKIA[A-Z0-9]{16}|apify_api_[A-Za-z0-9]{20,}|pat[A-Za-z0-9]{14}\.[0-9a-f]{64}|sk_live_[A-Za-z0-9]{24,}|shpat_[a-f0-9]{32}|shpca_[a-f0-9]{32}|shpss_[a-f0-9]{32}'
+
+refuse() {
+    {
+        echo ""
+        echo "[X] pre-push security scan could not see what this push would publish."
+        echo ""
+        echo "    $1"
+        echo ""
+        echo "    Refusing the push rather than reporting an all-clear it never earned."
+        echo ""
+    } >&2
+    exit 1
+}
+
+# git calls this hook as: pre-push <remote name or url> <push url>, then one line per ref on
+# stdin: "<local ref> <local oid> <remote ref> <remote oid>". A remote with several push URLs
+# runs the hook once per URL, and $2 is the URL after any insteadOf/pushInsteadOf rewrite.
+NULL_OID="0000000000000000000000000000000000000000"
+URL="${2:-${1:-}}"
+# A local replace ref can make a commit the target has look like a descendant of new content.
+export GIT_NO_REPLACE_OBJECTS=1
+# Do NOT also disable .git/info/grafts: git's push follows grafts when choosing what to send, so the
+# scan must see the same graph (measured 2026-09-17: GIT_GRAFT_FILE=/dev/null here let a key through).
+
+TIPS=""
+REFNAMES=""
+while read -r local_ref local_oid remote_ref remote_oid; do
+    [ -z "${local_ref:-}" ] && continue
+    [ "$local_oid" = "$NULL_OID" ] && continue      # a delete publishes nothing
+    TIPS+="$local_oid"$'\n'
+    REFNAMES+="$local_ref"$'\n'"$remote_ref"$'\n'
+done
+[ -z "$TIPS" ] && exit 0
+
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/pre-push-scan.XXXXXX") || refuse "mktemp failed"
+trap 'rm -rf "$WORK"' EXIT
+
+# WHAT THE TARGET ALREADY HAS (rewritten 2026-09-17). Ask the push URL itself, never local
+# remote-tracking refs: an adversarial review published a planted AKIA-prefixed key with exit 0
+# through four ways those refs lie (a pushurl that differs from the fetch url; a remote with two
+# push URLs; remote "pub/priv" matching --remotes=pub; a stale tracking ref after a server-side
+# clean-up). If URL rewriting would send ls-remote somewhere other than the push, refuse.
+[ -n "$URL" ] || refuse "git did not pass a push URL."
+LS_URL=$(git ls-remote --get-url "$URL" 2>/dev/null || true)
+[ "$LS_URL" = "$URL" ] || refuse "url rewriting sends ls-remote to '$LS_URL' but the push goes to '$URL'."
+git ls-remote -- "$URL" > "$WORK/advertised" 2>"$WORK/err" \
+    || refuse "git ls-remote could not list what $URL already has: $(cat "$WORK/err")"
+awk '$1 ~ /^[0-9a-f]+$/ {print $1}' "$WORK/advertised" | sort -u \
+    | git cat-file --batch-check='%(objectname) %(objecttype)' 2>/dev/null \
+    | awk '$2 == "commit" || $2 == "tag" {print "^" $1}' > "$WORK/known"
+
+# WHAT THIS PUSH PUBLISHES = every object reachable from the pushed tips that the target lacks.
+# All tips go through ONE --stdin list with explicit ^negatives, so no "--not" can flip a later
+# tip (a clean branch listed before a key branch used to hide the key branch).
+{ printf '%s' "$TIPS"; cat "$WORK/known"; } | git rev-list --objects --stdin > "$WORK/objects" 2>"$WORK/err" \
+    || refuse "git rev-list could not enumerate the objects this push publishes: $(cat "$WORK/err")"
+cut -d' ' -f1 "$WORK/objects" | git cat-file --batch-check='%(objectname) %(objecttype)' > "$WORK/types" \
+    || refuse "git cat-file could not type the pushed objects"
+cut -d' ' -f1 "$WORK/types" | git cat-file --batch > "$WORK/all.bin" \
+    || refuse "git cat-file could not read the pushed objects"
+awk '$2 != "blob" {print $1}' "$WORK/types" | git cat-file --batch > "$WORK/meta.bin" \
+    || refuse "git cat-file could not read the pushed commits, tags and trees"
+
+# Blob content for the BLOCKLIST scan: added lines only, so editing a file that legitimately carries
+# a listed string (a public site's own contact line) does not block. Every line starting "+" is
+# kept, including "+++ b/<name>" and added lines that themselves start with "++".
+# --no-textconv: a .gitattributes diff driver must not rewrite what we read. showRoot forced on.
+# --diff-merges=remerge shows what a 2-parent merge itself added. Known gap, blocklist words only:
+# an octopus merge's own additions (API keys in them are still caught by the object scan).
+{ printf '%s' "$TIPS"; cat "$WORK/known"; } | git -c log.showRoot=true log --stdin -p --text --no-textconv \
+    --no-color --no-ext-diff --diff-merges=remerge --format= \
+    -- . ':(exclude,glob)**/package-lock.json' ':(exclude,glob)**/yarn.lock' ':(exclude,glob)**/pnpm-lock.yaml' \
+    > "$WORK/patch" 2>"$WORK/err" \
+    || refuse "git log could not produce the patch series: $(cat "$WORK/err")"
+
+# Corpora. API KEYS: every byte of every new object (commits with author lines and messages,
+# annotated tags, trees with file names, whole blobs) plus ref names. BLOCKLIST: new commits,
+# tags and trees in full, ref names, and the added lines of blob content.
+tr -d '\000' < "$WORK/all.bin" > "$WORK/keys"; printf '%s' "$REFNAMES" >> "$WORK/keys"
+{ tr -d '\000' < "$WORK/meta.bin"; printf '%s' "$REFNAMES"; grep -a '^+' "$WORK/patch" || true; } > "$WORK/literals"
+
+VIOLATIONS=""
+
+# Literal-string scan from blocklist file (if available)
+if [ -f "$BLOCKLIST" ]; then
+    LITERAL_PATTERNS=$(awk '
+        /^## §1/ { skip = 1; next }
+        /^## §[2-9]/ { skip = 0 }
+        !skip && /^- `[^`]+`/ {
+            match($0, /`[^`]+`/)
+            s = substr($0, RSTART + 1, RLENGTH - 2)
+            sub(/^\*@/, "@", s)
+            if (s != "") print s
+        }
+    ' "$BLOCKLIST" | sort -u)
+
+    if [ -n "$LITERAL_PATTERNS" ]; then
+        while IFS= read -r pat; do
+            [ -z "$pat" ] && continue
+            if grep -aqF -- "$pat" "$WORK/literals"; then
+                VIOLATIONS+="literal: $pat"$'\n'
+            fi
+        done <<< "$LITERAL_PATTERNS"
+    fi
+fi
+
+# Regex API-key sweep (always runs). awk, not head: head closing the pipe early kills sort with
+# SIGPIPE, and under pipefail that would exit before the explanation below is printed.
+if grep -aqE "$API_KEY_REGEX" "$WORK/keys"; then
+    matches=$(grep -aoE "$API_KEY_REGEX" "$WORK/keys" | sort -u | awk 'NR<=5')
+    VIOLATIONS+="API key pattern matches: $matches"$'\n'
+fi
+
+if [ -n "$VIOLATIONS" ]; then
+    {
+        echo ""
+        echo "[X] pre-push security scan BLOCKED the push"
+        echo ""
+        echo "The following sensitive patterns were detected in what this push would publish:"
+        echo ""
+        echo "$VIOLATIONS" | sed 's/^/  /'
+        echo ""
+        echo "Fix the offending content (amend or new commit) and try again."
+        echo "To override (NOT recommended), use: git push --no-verify"
+        echo ""
+    } >&2
+    exit 1
+fi
+
+echo "[OK] pre-push security scan PASSED" >&2
+exit 0
